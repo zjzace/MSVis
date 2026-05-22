@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# Large raw/input/result files
+*.mzXML
+*.mzid
+*.pepXML
+*.tsv
+*.fil.tsv
+
+# Generated outputs
+outputs*/

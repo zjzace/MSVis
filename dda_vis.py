@@ -1,0 +1,670 @@
+#!/usr/bin/env python3
+"""DDA spectrum visualization for a target peptide from mzXML + pepXML.
+
+Output one PDF per scan, with precursor metadata and b/y ion annotations.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import matplotlib
+
+matplotlib.use("Agg")
+matplotlib.rcParams["pdf.fonttype"] = 42
+matplotlib.rcParams["ps.fonttype"] = 42
+matplotlib.rcParams["text.usetex"] = False
+import matplotlib.pyplot as plt
+import numpy as np
+from pyteomics import mzxml, pepxml
+
+PROTON = 1.00727646688
+H2O = 18.0105646837
+NH3 = 17.026549101
+
+AA_MASS = {
+    "A": 71.037113805,
+    "R": 156.10111105,
+    "N": 114.04292747,
+    "D": 115.026943065,
+    "C": 103.009184505,
+    "E": 129.042593135,
+    "Q": 128.05857754,
+    "G": 57.021463735,
+    "H": 137.058911875,
+    "I": 113.084064015,
+    "L": 113.084064015,
+    "K": 128.09496305,
+    "M": 131.040484645,
+    "F": 147.068413945,
+    "P": 97.052763875,
+    "S": 87.032028435,
+    "T": 101.047678505,
+    "W": 186.07931298,
+    "Y": 163.063328575,
+    "V": 99.068413945,
+}
+
+B_COLOR = "#1C75BC"
+Y_COLOR = "#BE1E2D"
+BY_COLOR = "#7F3F98"
+
+
+@dataclass
+class PSM:
+    scan_id: int
+    charge: int
+    precursor_neutral_mass: float
+    precursor_mz: float
+    peptide: str
+    modified_peptide: str
+    protein_id: str
+    qvalue: Optional[float]
+    modifications: List[Dict[str, float]]
+
+
+def parse_optional_float(value: str) -> Optional[float]:
+    text = value.strip().lower()
+    if text in {"none", "null", "na", "nan"}:
+        return None
+    return float(value)
+
+
+def safe_text(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("._-") or "NA"
+
+
+def get_qvalue(hit: Dict) -> Optional[float]:
+    scores = hit.get("search_score", {}) or {}
+    qv = scores.get("QValue")
+    return float(qv) if qv is not None else None
+
+
+def select_psms(
+    pepxml_path: Path,
+    target_peptide: str,
+    max_qvalue: Optional[float],
+) -> Dict[int, PSM]:
+    selected: Dict[int, PSM] = {}
+
+    with pepxml.read(str(pepxml_path)) as reader:
+        for sq in reader:
+            scan_id = int(sq.get("start_scan"))
+            charge = int(sq.get("assumed_charge"))
+            neutral_mass = float(sq.get("precursor_neutral_mass"))
+            precursor_mz = (neutral_mass + charge * PROTON) / charge
+
+            for hit in sq.get("search_hit", []):
+                if int(hit.get("hit_rank", 9999)) != 1:
+                    continue
+                if hit.get("peptide") != target_peptide:
+                    continue
+
+                qv = get_qvalue(hit)
+                if max_qvalue is not None and qv is not None and qv > max_qvalue:
+                    continue
+
+                proteins = hit.get("proteins") or []
+                protein_id = proteins[0].get("protein", "NA") if proteins else "NA"
+                modifications = hit.get("modifications") or []
+
+                psm = PSM(
+                    scan_id=scan_id,
+                    charge=charge,
+                    precursor_neutral_mass=neutral_mass,
+                    precursor_mz=precursor_mz,
+                    peptide=hit.get("peptide", target_peptide),
+                    modified_peptide=hit.get("modified_peptide", target_peptide),
+                    protein_id=protein_id,
+                    qvalue=qv,
+                    modifications=modifications,
+                )
+
+                old = selected.get(scan_id)
+                if old is None:
+                    selected[scan_id] = psm
+                else:
+                    old_q = float("inf") if old.qvalue is None else old.qvalue
+                    new_q = float("inf") if psm.qvalue is None else psm.qvalue
+                    if new_q < old_q:
+                        selected[scan_id] = psm
+
+    return selected
+
+
+def residue_masses_with_mods(peptide: str, modifications: List[Dict[str, float]]) -> Tuple[List[float], float, float]:
+    masses = []
+    for aa in peptide:
+        if aa not in AA_MASS:
+            raise ValueError(f"Unsupported amino acid '{aa}' in peptide {peptide}")
+        masses.append(AA_MASS[aa])
+
+    nterm_delta = 0.0
+    cterm_delta = 0.0
+
+    for mod in modifications:
+        pos = int(mod["position"])
+        mod_mass = float(mod["mass"])
+        if 1 <= pos <= len(peptide):
+            masses[pos - 1] = mod_mass
+        elif pos == 0:
+            # pepXML stores absolute modified N-terminus mass.
+            nterm_delta = mod_mass - 1.00782503223
+        elif pos == len(peptide) + 1:
+            # pepXML stores absolute modified C-terminus mass.
+            cterm_delta = mod_mass - 17.00273965163
+
+    return masses, nterm_delta, cterm_delta
+
+
+def theoretical_by_ions(
+    peptide: str,
+    modifications: List[Dict[str, float]],
+    max_frag_charge: int = 2,
+    annotate_neutral_losses: bool = True,
+) -> List[Tuple[str, float, str]]:
+    if len(peptide) < 2:
+        return []
+
+    masses, nterm_delta, cterm_delta = residue_masses_with_mods(peptide, modifications)
+    prefix = np.cumsum(masses)
+    total = prefix[-1]
+
+    ions: List[Tuple[str, float, str]] = []
+    n = len(peptide)
+    for i in range(1, n):
+        b_neutral = prefix[i - 1] + nterm_delta
+        y_len = n - i
+        y_neutral = (total - prefix[i - 1]) + H2O + cterm_delta
+
+        for z in range(1, max_frag_charge + 1):
+            b_mz = (b_neutral + z * PROTON) / z
+            y_mz = (y_neutral + z * PROTON) / z
+            ions.append((f"b{i}^{z}+", b_mz, "b"))
+            ions.append((f"y{y_len}^{z}+", y_mz, "y"))
+
+            # Keep neutral-loss annotation limited to 1+ to reduce label crowding.
+            if annotate_neutral_losses and z == 1:
+                b_h2o_mz = ((b_neutral - H2O) + PROTON)
+                b_nh3_mz = ((b_neutral - NH3) + PROTON)
+                y_h2o_mz = ((y_neutral - H2O) + PROTON)
+                y_nh3_mz = ((y_neutral - NH3) + PROTON)
+
+                if b_neutral > H2O:
+                    ions.append((f"b{i}o^{z}+", b_h2o_mz, "b"))
+                if b_neutral > NH3:
+                    ions.append((f"b{i}*^{z}+", b_nh3_mz, "b"))
+                if y_neutral > H2O:
+                    ions.append((f"y{y_len}o^{z}+", y_h2o_mz, "y"))
+                if y_neutral > NH3:
+                    ions.append((f"y{y_len}*^{z}+", y_nh3_mz, "y"))
+
+    return ions
+
+
+def ppm_error(obs: float, theo: float) -> float:
+    return (obs - theo) / theo * 1e6
+
+
+def match_theoretical_ions(
+    mz_array: np.ndarray,
+    int_array: np.ndarray,
+    theoretical: Iterable[Tuple[str, float, str]],
+    frag_tol_ppm: float,
+) -> List[Dict]:
+    matches: List[Dict] = []
+    if mz_array.size == 0:
+        return matches
+
+    for ion_name, ion_mz, ion_series in theoretical:
+        tol = ion_mz * frag_tol_ppm * 1e-6
+        left = np.searchsorted(mz_array, ion_mz - tol, side="left")
+        right = np.searchsorted(mz_array, ion_mz + tol, side="right")
+        if left >= right:
+            continue
+
+        local_idx = np.argmax(int_array[left:right])
+        peak_idx = int(left + local_idx)
+        obs_mz = float(mz_array[peak_idx])
+        err_ppm = ppm_error(obs_mz, ion_mz)
+        matches.append(
+            {
+                "ion": ion_name,
+                "series": ion_series,
+                "theoretical_mz": float(ion_mz),
+                "peak_idx": peak_idx,
+                "obs_mz": obs_mz,
+                "intensity": float(int_array[peak_idx]),
+                "ppm_error": float(err_ppm),
+            }
+        )
+
+    return matches
+
+
+def parse_ion_name(ion_name: str) -> Tuple[str, int, int, str]:
+    m = re.fullmatch(r"([by])(\d+)([o*]?)\^(\d+)\+", ion_name)
+    if not m:
+        raise ValueError(f"Unexpected ion name format: {ion_name}")
+    nl = m.group(3) if m.group(3) else ""
+    return m.group(1), int(m.group(2)), int(m.group(4)), nl
+
+
+def ion_label(ion_name: str) -> str:
+    series, idx, charge, nl = parse_ion_name(ion_name)
+    core = f"{series}{idx}{nl}"
+    superscript_map = str.maketrans("0123456789+-", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻")
+    return f"{core}{f'{charge}+'.translate(superscript_map)}"
+
+
+def pick_peak_labels(
+    matches: List[Dict],
+    mz_array: np.ndarray,
+    max_labels_per_series: int,
+    min_mz_gap: float,
+) -> List[Dict]:
+    selected: List[Dict] = []
+    for series in ("b", "y"):
+        candidates = [m for m in matches if m["series"] == series]
+        candidates.sort(key=lambda x: x["intensity"], reverse=True)
+        picked: List[Dict] = []
+        used_mz: List[float] = []
+        for m in candidates:
+            mz = float(mz_array[m["peak_idx"]])
+            if any(abs(mz - x) < min_mz_gap for x in used_mz):
+                continue
+            picked.append(m)
+            used_mz.append(mz)
+            if len(picked) >= max_labels_per_series:
+                break
+        selected.extend(picked)
+
+    # Merge labels that land on the same peak.
+    by_peak: Dict[int, List[Dict]] = {}
+    for m in selected:
+        by_peak.setdefault(m["peak_idx"], []).append(m)
+
+    merged: List[Dict] = []
+    for peak_idx, rows in by_peak.items():
+        rows.sort(key=lambda x: (x["series"], -x["intensity"]))
+        merged.append({"peak_idx": peak_idx, "items": rows})
+    merged.sort(key=lambda x: x["peak_idx"])
+    return merged
+
+
+def select_cleavage_top_labels(
+    matches: List[Dict],
+    peptide_len: int,
+    base_peak_intensity: float,
+    min_rel_intensity: float,
+) -> Dict[int, Dict[str, Dict]]:
+    # cleavage index i means break between residues i and i+1 (1-based), 1..len-1
+    cleavage_map: Dict[int, Dict[str, Dict]] = {i: {} for i in range(1, peptide_len)}
+    if peptide_len < 2 or base_peak_intensity <= 0:
+        return cleavage_map
+
+    abs_min_int = base_peak_intensity * min_rel_intensity
+    for m in matches:
+        if m["intensity"] < abs_min_int:
+            continue
+        series, idx, _charge, nl = parse_ion_name(m["ion"])
+        if nl:
+            # Top backbone map should only reflect primary b/y ions.
+            continue
+        cleavage = idx if series == "b" else peptide_len - idx
+        if cleavage < 1 or cleavage >= peptide_len:
+            continue
+        current = cleavage_map[cleavage].get(series)
+        if current is None:
+            cleavage_map[cleavage][series] = m
+            continue
+        cur_err = abs(current["ppm_error"])
+        new_err = abs(m["ppm_error"])
+        if new_err < cur_err or (new_err == cur_err and m["intensity"] > current["intensity"]):
+            cleavage_map[cleavage][series] = m
+    return cleavage_map
+
+
+def draw_top_backbone(ax: plt.Axes, peptide: str, cleavage_labels: Dict[int, Dict[str, Dict]]) -> None:
+    n = len(peptide)
+    if n < 2:
+        return
+
+    ax.set_xlim(-0.5, n - 0.5)
+    ax.set_ylim(0.0, 1.0)
+    ax.axis("off")
+
+    # Sequence letters
+    for i, aa in enumerate(peptide):
+        ax.text(
+            i,
+            0.50,
+            aa,
+            ha="center",
+            va="center",
+            fontsize=18,
+            color="black",
+            fontfamily="DejaVu Sans",
+            fontweight="bold",
+        )
+
+    # Cleavage markers and labels in the legacy style:
+    # b ions below, y ions above the peptide sequence.
+    for i in range(1, n):
+        x = i - 0.5
+        cell = cleavage_labels[i]
+
+        if "y" in cell:
+            y_line = 0.78
+            h_len = 0.68
+            ax.plot([x, x], [0.58, y_line], color=Y_COLOR, linewidth=0.8)
+            ax.plot([x, x + h_len], [y_line, y_line], color=Y_COLOR, linewidth=0.8)
+            ax.text(
+                x + 0.04,
+                y_line - 0.02,
+                ion_label(cell["y"]["ion"]),
+                fontsize=8,
+                ha="left",
+                va="top",
+                color=Y_COLOR,
+                fontfamily="DejaVu Sans",
+            )
+
+        if "b" in cell:
+            b_line = 0.22
+            h_len = 0.68
+            ax.plot([x, x], [0.42, b_line], color=B_COLOR, linewidth=0.8)
+            ax.plot([x - h_len, x], [b_line, b_line], color=B_COLOR, linewidth=0.8)
+            ax.text(
+                x - 0.06,
+                b_line + 0.02,
+                ion_label(cell["b"]["ion"]),
+                fontsize=8,
+                ha="right",
+                va="bottom",
+                color=B_COLOR,
+                fontfamily="DejaVu Sans",
+            )
+
+
+def render_spectrum(
+    psm: PSM,
+    mz_array: np.ndarray,
+    int_array: np.ndarray,
+    sample_id: str,
+    outdir: Path,
+    frag_tol_ppm: float,
+    max_labels_per_series: int,
+    topmap_min_rel_int: float,
+    intensity_scale: str,
+    annotate_neutral_losses: bool,
+) -> Path:
+    theoretical = theoretical_by_ions(
+        psm.peptide,
+        psm.modifications,
+        max_frag_charge=2,
+        annotate_neutral_losses=annotate_neutral_losses,
+    )
+    matches = match_theoretical_ions(mz_array, int_array, theoretical, frag_tol_ppm)
+
+    peak_series: Dict[int, str] = {}
+    for m in matches:
+        idx = m["peak_idx"]
+        if idx not in peak_series:
+            peak_series[idx] = m["series"]
+        elif peak_series[idx] != m["series"]:
+            peak_series[idx] = "by"
+
+    ymax_raw = float(int_array.max()) if int_array.size else 1.0
+
+    if intensity_scale == "relative":
+        plot_int = (int_array / ymax_raw) * 100.0 if ymax_raw > 0 else int_array
+        y_label = "Relative ion abundance (%)"
+        y_max = 106.0
+    else:
+        plot_int = int_array
+        y_label = "Ion intensity"
+        y_max = ymax_raw * 1.06 if ymax_raw > 0 else 1.0
+
+    labels = pick_peak_labels(matches, mz_array, max_labels_per_series=max_labels_per_series, min_mz_gap=12.0)
+    cleavage_labels = select_cleavage_top_labels(
+        matches=matches,
+        peptide_len=len(psm.peptide),
+        base_peak_intensity=ymax_raw,
+        min_rel_intensity=topmap_min_rel_int,
+    )
+    fig = plt.figure(figsize=(14, 7.2))
+    gs = fig.add_gridspec(2, 1, height_ratios=[1.5, 5], hspace=0.02)
+    ax_top = fig.add_subplot(gs[0])
+    ax = fig.add_subplot(gs[1])
+    draw_top_backbone(ax_top, psm.peptide, cleavage_labels)
+
+    ax.vlines(mz_array, 0, plot_int, color="#8F8F8F", linewidth=0.5, alpha=0.5)
+    if matches:
+        b_idx = [m["peak_idx"] for m in matches if peak_series[m["peak_idx"]] == "b"]
+        y_idx = [m["peak_idx"] for m in matches if peak_series[m["peak_idx"]] == "y"]
+        by_idx = [m["peak_idx"] for m in matches if peak_series[m["peak_idx"]] == "by"]
+
+        if b_idx:
+            ax.vlines(mz_array[b_idx], 0, plot_int[b_idx], color=B_COLOR, linewidth=0.9, alpha=0.95, label="b ions")
+        if y_idx:
+            ax.vlines(mz_array[y_idx], 0, plot_int[y_idx], color=Y_COLOR, linewidth=0.9, alpha=0.95, label="y ions")
+        if by_idx:
+            ax.vlines(mz_array[by_idx], 0, plot_int[by_idx], color=BY_COLOR, linewidth=0.9, alpha=0.95, label="b/y overlap")
+
+    for j, row in enumerate(labels):
+        idx = row["peak_idx"]
+        mz = float(mz_array[idx])
+        inten = float(plot_int[idx])
+        label_text = "/".join(ion_label(item["ion"]) for item in row["items"])
+        series_set = {item["series"] for item in row["items"]}
+        if series_set == {"b"}:
+            color = B_COLOR
+        elif series_set == {"y"}:
+            color = Y_COLOR
+        else:
+            color = BY_COLOR
+        yoff = 2.5 + (j % 3) * 2.0
+        label_y = min(inten + yoff, y_max * 0.98)
+
+        ax.text(
+            mz,
+            label_y,
+            label_text,
+            fontsize=9,
+            ha="center",
+            va="bottom",
+            color=color,
+            fontfamily="DejaVu Sans",
+        )
+
+    ax.set_xlabel("m/z")
+    ax.set_ylabel(y_label)
+    ax.set_ylim(0, y_max)
+    ax.spines["right"].set_visible(False)
+    ax.spines["top"].set_visible(False)
+    ax.spines["left"].set_linewidth(0.6)
+    ax.spines["bottom"].set_linewidth(0.6)
+    ax.tick_params(width=0.6, labelsize=9)
+
+    meta = f"scan_id={psm.scan_id} | precursor_m/z={psm.precursor_mz:.6f} | z={psm.charge}"
+    ax.text(0.01, 0.98, meta, transform=ax.transAxes, va="top", ha="left", fontsize=10)
+
+    if psm.qvalue is not None:
+        ax.text(0.01, 0.92, f"QValue={psm.qvalue:.4g}", transform=ax.transAxes, va="top", ha="left", fontsize=9)
+
+    if matches:
+        ax.legend(loc="upper right", frameon=False, fontsize=9)
+
+    fig.subplots_adjust(top=0.93, bottom=0.08, left=0.07, right=0.99)
+
+    fname = (
+        f"{safe_text(psm.protein_id)}-"
+        f"{safe_text(sample_id)}-"
+        f"{safe_text(psm.peptide)}-"
+        f"{psm.scan_id}.pdf"
+    )
+    outpath = outdir / fname
+    fig.savefig(outpath)
+    plt.close(fig)
+    return outpath
+
+
+def parse_mzxml_and_render(
+    mzxml_path: Path,
+    psms_by_scan: Dict[int, PSM],
+    sample_id: str,
+    outdir: Path,
+    frag_tol_ppm: float,
+    max_labels_per_series: int,
+    topmap_min_rel_int: float,
+    intensity_scale: str,
+    annotate_neutral_losses: bool,
+) -> Tuple[int, int, List[int], List[Path]]:
+    wanted = set(psms_by_scan.keys())
+    found_scans: set[int] = set()
+    outputs: List[Path] = []
+
+    with mzxml.read(str(mzxml_path)) as reader:
+        for scan in reader:
+            scan_id = int(scan.get("num", -1))
+            if scan_id not in wanted:
+                continue
+
+            ms_level = int(scan.get("msLevel", 0))
+            if ms_level != 2:
+                continue
+
+            mz_array = np.asarray(scan.get("m/z array", []), dtype=float)
+            int_array = np.asarray(scan.get("intensity array", []), dtype=float)
+            if mz_array.size == 0 or int_array.size == 0:
+                continue
+
+            order = np.argsort(mz_array)
+            mz_array = mz_array[order]
+            int_array = int_array[order]
+
+            psm = psms_by_scan[scan_id]
+            out_pdf = render_spectrum(
+                psm=psm,
+                mz_array=mz_array,
+                int_array=int_array,
+                sample_id=sample_id,
+                outdir=outdir,
+                frag_tol_ppm=frag_tol_ppm,
+                max_labels_per_series=max_labels_per_series,
+                topmap_min_rel_int=topmap_min_rel_int,
+                intensity_scale=intensity_scale,
+                annotate_neutral_losses=annotate_neutral_losses,
+            )
+            outputs.append(out_pdf)
+            found_scans.add(scan_id)
+
+            if found_scans == wanted:
+                break
+
+    missing = sorted(wanted - found_scans)
+    return len(wanted), len(found_scans), missing, outputs
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Visualize DDA spectra for a target peptide from pepXML and mzXML.")
+    p.add_argument("--pepxml", required=True, type=Path, help="Path to MS-GF+ pepXML file")
+    p.add_argument("--mzxml", required=True, type=Path, help="Path to mzXML file")
+    p.add_argument("--peptide", required=True, help="Target unmodified peptide sequence for exact matching")
+    p.add_argument("--outdir", type=Path, default=Path("dda_vis_output"), help="Output directory for PDFs")
+    p.add_argument(
+        "--sample-id",
+        default=None,
+        help="Sample ID in output filename. Default: mzXML basename without extension.",
+    )
+    p.add_argument(
+        "--max-qvalue",
+        type=parse_optional_float,
+        default=0.01,
+        help="Max QValue filter. Use 'None' to disable. Default: 0.01",
+    )
+    p.add_argument(
+        "--frag-tol-ppm",
+        type=float,
+        default=20.0,
+        help="Fragment ion match tolerance in ppm. Default: 20",
+    )
+    p.add_argument(
+        "--max-labels-per-series",
+        type=int,
+        default=20,
+        help="Maximum number of text labels per ion series (b and y). Default: 20",
+    )
+    p.add_argument(
+        "--topmap-min-rel-int",
+        type=float,
+        default=0.02,
+        help="Minimum relative intensity for top backbone labels. Default: 0.02",
+    )
+    p.add_argument(
+        "--intensity-scale",
+        choices=("absolute", "relative"),
+        default="absolute",
+        help="Spectrum intensity scale: absolute or relative. Default: absolute",
+    )
+    nl_group = p.add_mutually_exclusive_group()
+    nl_group.add_argument(
+        "--annotate-neutral-losses",
+        dest="annotate_neutral_losses",
+        action="store_true",
+        help="Annotate neutral-loss ions: H2O as 'o', NH3 as '*'. Default: enabled.",
+    )
+    nl_group.add_argument(
+        "--no-annotate-neutral-losses",
+        dest="annotate_neutral_losses",
+        action="store_false",
+        help="Disable annotation of neutral-loss ions.",
+    )
+    p.set_defaults(annotate_neutral_losses=True)
+    return p
+
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
+
+    sample_id = args.sample_id if args.sample_id else args.mzxml.stem
+    args.outdir.mkdir(parents=True, exist_ok=True)
+
+    psms_by_scan = select_psms(args.pepxml, args.peptide, args.max_qvalue)
+    if not psms_by_scan:
+        print("No matching PSMs found with current filters.")
+        return
+
+    total, found, missing, outputs = parse_mzxml_and_render(
+        mzxml_path=args.mzxml,
+        psms_by_scan=psms_by_scan,
+        sample_id=sample_id,
+        outdir=args.outdir,
+        frag_tol_ppm=args.frag_tol_ppm,
+        max_labels_per_series=args.max_labels_per_series,
+        topmap_min_rel_int=args.topmap_min_rel_int,
+        intensity_scale=args.intensity_scale,
+        annotate_neutral_losses=args.annotate_neutral_losses,
+    )
+
+    print(f"Target peptide: {args.peptide}")
+    print(f"Matched scan IDs in pepXML: {total}")
+    print(f"Rendered MS2 PDFs: {found}")
+    if missing:
+        preview = ", ".join(map(str, missing[:20]))
+        tail = " ..." if len(missing) > 20 else ""
+        print(f"Missing MS2 scans in mzXML: {len(missing)} [{preview}{tail}]")
+
+    print(f"Output directory: {args.outdir.resolve()}")
+    if outputs:
+        print("Example output file:")
+        print(f"  {outputs[0]}")
+
+
+if __name__ == "__main__":
+    main()
