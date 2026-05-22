@@ -1,10 +1,14 @@
-# DDA Peptide Spectrum Visualization
+# MS2 Spectrum Visualization (DDA + PRM)
 
-Generate one annotated MS2 spectrum PDF per scan for a target peptide using:
-- Raw spectra: `mzXML`
-- Identification: `pepXML` (MS-GF+)
+This directory provides two scripts with matched figure style:
 
-## Environment (mamba)
+- `dda_vis.py`: DDA visualization from `pepXML + mzXML`
+- `prm_vis.py`: PRM visualization from `target list + mzXML`
+
+Both scripts export one annotated PDF spectrum per selected scan and keep the
+same visual layout (top peptide cleavage map + lower MS2 peak panel).
+
+## Environment
 
 ```bash
 cd /home/Share/Codex_CRC/MS/20260520_vis
@@ -12,13 +16,22 @@ rtk mamba env create -f environment.yml
 rtk mamba activate dda-vis
 ```
 
-Or run without activation:
+Or run directly:
 
 ```bash
 rtk mamba run -n dda-vis python dda_vis.py --help
+rtk mamba run -n dda-vis python prm_vis.py --help
 ```
 
-## Usage
+## DDA Workflow (`dda_vis.py`)
+
+### Input
+
+- Raw spectra: `mzXML`
+- Search result: `pepXML` (MS-GF+ style)
+- Target peptide sequence: exact match on unmodified peptide
+
+### Example
 
 ```bash
 rtk mamba run -n dda-vis python dda_vis.py \
@@ -28,35 +41,102 @@ rtk mamba run -n dda-vis python dda_vis.py \
   --outdir outputs
 ```
 
-## Output
+### DDA Key options
 
-- One PDF per scan ID.
-- Filename pattern:
-  - `protein_id-sample_id-peptide_sequence-scan_id.pdf`
-- Figure contains:
-  - `scan_id`
-  - precursor `m/z`
-  - precursor charge `z`
-  - matched b/y ion highlights and labels in spectrum panel (default 20 ppm)
-  - no connector line from peak to text label
-  - top peptide cleavage map:
-    - bold peptide sequence
-    - `y` cleavage lines/labels above (red), `b` cleavage lines/labels below (blue)
-    - charge states shown as superscript in labels (example: `y7²⁺`)
-  - lower panel does not repeat peptide sequence title
+- `--max-qvalue 0.01` (default): keep `QValue <= 0.01`; disable via `--max-qvalue None`
+- `--frag-tol-ppm 20` (default): fragment matching tolerance
+- `--max-labels-per-series 20` (default): cap b/y labels in lower panel
+- `--topmap-min-rel-int 0.02` (default): minimum relative intensity for top-map b/y labels
+- `--intensity-scale {absolute,relative}` (default `absolute`)
+- `--sample-id <text>`: override sample ID in output filename
+- `--annotate-neutral-losses` / `--no-annotate-neutral-losses` (default enabled)
 
-## Key options
+## PRM Workflow (`prm_vis.py`)
 
-- `--max-qvalue 0.01` (default): keep `QValue <= 0.01`
-  - Disable filter: `--max-qvalue None`
-- `--frag-tol-ppm 20` (default)
+### Core behavior
+
+- Match MS2 scans to target precursor m/z + charge
+- Select one representative scan per target:
+  - scan with highest `basePeakIntensity`
+- Render with the same style as `dda_vis.py`
+
+### `--prm-list` input modes
+
+`--prm-list` supports both:
+
+1. **File path** (TSV)
+2. **Direct peptide text**
+
+#### Mode 1: TSV file path
+
+Example:
+
+```bash
+rtk mamba run -n dda-vis python prm_vis.py \
+  --prm-list /home/Share/Codex_CRC/MS/20260521_PRM/PRM_list.txt \
+  --mzxml /home/Share/Codex_CRC/MS/20260521_PRM/HCT116_PRM_1.mzXML \
+  --outdir prm_outputs \
+  --sample-id HCT116_PRM_1
+```
+
+Supported TSV header patterns:
+
+- Standard: `gene`, `peptide_sequence`, `charge`
+- Flexible:
+  - peptide column can be `peptide_sequence` / `peptide` / `sequence`
+  - charge column can be `charge` / `z`
+  - ID column can be `gene` / `peptide_id` / first column
+
+If your first column is peptide ID, it is supported.
+
+#### Mode 2: direct peptide text
+
+With explicit charge:
+
+```bash
+rtk mamba run -n dda-vis python prm_vis.py \
+  --prm-list "ELTYPQQQLRDDDVGELGR/2,QVEWGAQLWVLYAGVERPVSR/3" \
+  --mzxml /home/Share/Codex_CRC/MS/20260521_PRM/HCT116_PRM_1.mzXML \
+  --outdir prm_outputs
+```
+
+Without explicit charge:
+
+```bash
+rtk mamba run -n dda-vis python prm_vis.py \
+  --prm-list "ELTYPQQQLRDDDVGELGR QVEWGAQLWVLYAGVERPVSR" \
+  --direct-charges 2,3,4 \
+  --mzxml /home/Share/Codex_CRC/MS/20260521_PRM/HCT116_PRM_1.mzXML \
+  --outdir prm_outputs
+```
+
+### PRM Key options
+
+- `--precursor-tol-ppm 10` (default): precursor matching tolerance
+- `--isotope-errors 0,1` (default): allow monoisotopic and +1 isotope targeting
+- `--direct-charges 2,3,4` (default): used only for direct peptide mode without `/z`
+- `--frag-tol-ppm 20` (default): fragment matching tolerance
 - `--max-labels-per-series 20` (default)
-- `--topmap-min-rel-int 0.02` (default): min relative intensity for top backbone cleavage labels
-- `--sample-id <text>`: override sample ID in filenames
-- `--annotate-neutral-losses` / `--no-annotate-neutral-losses`:
-  - annotate neutral-loss ions in peak labels (`o` for H2O loss, `*` for NH3 loss)
-  - default is enabled
+- `--topmap-min-rel-int 0.02` (default)
+- `--intensity-scale {absolute,relative}` (default `absolute`)
+- `--annotate-neutral-losses` / `--no-annotate-neutral-losses` (default enabled)
+
+## Figure/Output Details
+
+- Output file pattern:
+  - `protein_or_id-sample_id-z{charge}-peptide-scan_id.pdf`
+- Figure content:
+  - lower panel: MS2 peaks and matched b/y annotations
+  - upper panel: peptide cleavage map with b/y labels
+  - neutral loss labels:
+    - `o` for `-H2O`
+    - `*` for `-NH3`
+- Lower panel does not repeat peptide sequence title.
+- Peak-to-label connector lines are removed.
 
 ## Illustrator Compatibility
 
-- PDF text is exported with `pdf.fonttype=42`, so labels are kept as editable text in Illustrator.
+- PDF export uses:
+  - `matplotlib.rcParams["pdf.fonttype"] = 42`
+  - `matplotlib.rcParams["ps.fonttype"] = 42`
+- This keeps text as editable text objects in Illustrator (instead of paths) in normal cases.
