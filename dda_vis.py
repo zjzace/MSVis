@@ -57,6 +57,7 @@ BY_COLOR = "#7F3F98"
 @dataclass
 class PSM:
     scan_id: int
+    hit_rank: int
     charge: int
     precursor_neutral_mass: float
     precursor_mz: float
@@ -64,6 +65,7 @@ class PSM:
     modified_peptide: str
     protein_id: str
     qvalue: Optional[float]
+    pepqvalue: Optional[float]
     modifications: List[Dict[str, float]]
 
 
@@ -84,12 +86,80 @@ def get_qvalue(hit: Dict) -> Optional[float]:
     return float(qv) if qv is not None else None
 
 
+def get_pepqvalue(hit: Dict) -> Optional[float]:
+    scores = hit.get("search_score", {}) or {}
+    pqv = scores.get("PepQValue")
+    return float(pqv) if pqv is not None else None
+
+
+def normalized_sample_key(path: Path) -> str:
+    name = path.name.lower()
+    return re.sub(r"\.(pepxml|mzxml)$", "", name)
+
+
+def pair_sample_files(pepxml_paths: List[Path], mzxml_paths: List[Path]) -> List[Tuple[str, Path, Path]]:
+    if len(pepxml_paths) != len(mzxml_paths):
+        raise ValueError(
+            f"--pepxml and --mzxml must contain the same number of files "
+            f"(got {len(pepxml_paths)} and {len(mzxml_paths)})."
+        )
+
+    pep_map: Dict[str, Path] = {}
+    mz_map: Dict[str, Path] = {}
+
+    for p in pepxml_paths:
+        key = normalized_sample_key(p)
+        if key in pep_map:
+            raise ValueError(f"Duplicate pepXML basename after normalization: {p} and {pep_map[key]}")
+        pep_map[key] = p
+
+    for p in mzxml_paths:
+        key = normalized_sample_key(p)
+        if key in mz_map:
+            raise ValueError(f"Duplicate mzXML basename after normalization: {p} and {mz_map[key]}")
+        mz_map[key] = p
+
+    pep_keys = set(pep_map.keys())
+    mz_keys = set(mz_map.keys())
+    if pep_keys != mz_keys:
+        only_pep = sorted(pep_keys - mz_keys)
+        only_mz = sorted(mz_keys - pep_keys)
+        raise ValueError(
+            "basename matching failed between pepXML and mzXML inputs. "
+            f"Only in pepXML: {only_pep or '[]'}; only in mzXML: {only_mz or '[]'}"
+        )
+
+    return [(k, pep_map[k], mz_map[k]) for k in sorted(pep_keys)]
+
+
+def score_passes(
+    hit: Dict,
+    score_type: str,
+    qvalue_threshold: float,
+    pepqvalue_threshold: float,
+) -> bool:
+    if score_type == "none":
+        return True
+    if score_type in {"qvalue", "both"}:
+        qv = get_qvalue(hit)
+        if qv is None or qv > qvalue_threshold:
+            return False
+    if score_type in {"pepqvalue", "both"}:
+        pqv = get_pepqvalue(hit)
+        if pqv is None or pqv > pepqvalue_threshold:
+            return False
+    return True
+
+
 def select_psms(
     pepxml_path: Path,
     target_peptide: str,
-    max_qvalue: Optional[float],
-) -> Dict[int, PSM]:
-    selected: Dict[int, PSM] = {}
+    score_type: str,
+    qvalue_threshold: float,
+    pepqvalue_threshold: float,
+    max_hit_rank: Optional[int],
+) -> List[PSM]:
+    selected: List[PSM] = []
 
     with pepxml.read(str(pepxml_path)) as reader:
         for sq in reader:
@@ -99,21 +169,25 @@ def select_psms(
             precursor_mz = (neutral_mass + charge * PROTON) / charge
 
             for hit in sq.get("search_hit", []):
-                if int(hit.get("hit_rank", 9999)) != 1:
+                hit_rank = int(hit.get("hit_rank", 9999))
+                if max_hit_rank is not None and hit_rank > max_hit_rank:
                     continue
                 if hit.get("peptide") != target_peptide:
                     continue
 
-                qv = get_qvalue(hit)
-                if max_qvalue is not None and qv is not None and qv > max_qvalue:
+                if not score_passes(hit, score_type, qvalue_threshold, pepqvalue_threshold):
                     continue
 
                 proteins = hit.get("proteins") or []
                 protein_id = proteins[0].get("protein", "NA") if proteins else "NA"
                 modifications = hit.get("modifications") or []
+                qv = get_qvalue(hit)
+                pqv = get_pepqvalue(hit)
 
-                psm = PSM(
+                selected.append(
+                    PSM(
                     scan_id=scan_id,
+                    hit_rank=hit_rank,
                     charge=charge,
                     precursor_neutral_mass=neutral_mass,
                     precursor_mz=precursor_mz,
@@ -121,18 +195,12 @@ def select_psms(
                     modified_peptide=hit.get("modified_peptide", target_peptide),
                     protein_id=protein_id,
                     qvalue=qv,
+                    pepqvalue=pqv,
                     modifications=modifications,
                 )
+                )
 
-                old = selected.get(scan_id)
-                if old is None:
-                    selected[scan_id] = psm
-                else:
-                    old_q = float("inf") if old.qvalue is None else old.qvalue
-                    new_q = float("inf") if psm.qvalue is None else psm.qvalue
-                    if new_q < old_q:
-                        selected[scan_id] = psm
-
+    selected.sort(key=lambda x: (x.scan_id, x.hit_rank))
     return selected
 
 
@@ -506,7 +574,7 @@ def render_spectrum(
         f"{safe_text(psm.protein_id)}-"
         f"{safe_text(sample_id)}-"
         f"{safe_text(psm.peptide)}-"
-        f"{psm.scan_id}.pdf"
+        f"{psm.scan_id}-rank{psm.hit_rank}.pdf"
     )
     outpath = outdir / fname
     fig.savefig(outpath)
@@ -516,7 +584,7 @@ def render_spectrum(
 
 def parse_mzxml_and_render(
     mzxml_path: Path,
-    psms_by_scan: Dict[int, PSM],
+    psms: List[PSM],
     sample_id: str,
     outdir: Path,
     frag_tol_ppm: float,
@@ -525,6 +593,9 @@ def parse_mzxml_and_render(
     intensity_scale: str,
     annotate_neutral_losses: bool,
 ) -> Tuple[int, int, List[int], List[Path]]:
+    psms_by_scan: Dict[int, List[PSM]] = {}
+    for psm in psms:
+        psms_by_scan.setdefault(psm.scan_id, []).append(psm)
     wanted = set(psms_by_scan.keys())
     found_scans: set[int] = set()
     outputs: List[Path] = []
@@ -548,20 +619,20 @@ def parse_mzxml_and_render(
             mz_array = mz_array[order]
             int_array = int_array[order]
 
-            psm = psms_by_scan[scan_id]
-            out_pdf = render_spectrum(
-                psm=psm,
-                mz_array=mz_array,
-                int_array=int_array,
-                sample_id=sample_id,
-                outdir=outdir,
-                frag_tol_ppm=frag_tol_ppm,
-                max_labels_per_series=max_labels_per_series,
-                topmap_min_rel_int=topmap_min_rel_int,
-                intensity_scale=intensity_scale,
-                annotate_neutral_losses=annotate_neutral_losses,
-            )
-            outputs.append(out_pdf)
+            for psm in psms_by_scan[scan_id]:
+                out_pdf = render_spectrum(
+                    psm=psm,
+                    mz_array=mz_array,
+                    int_array=int_array,
+                    sample_id=sample_id,
+                    outdir=outdir,
+                    frag_tol_ppm=frag_tol_ppm,
+                    max_labels_per_series=max_labels_per_series,
+                    topmap_min_rel_int=topmap_min_rel_int,
+                    intensity_scale=intensity_scale,
+                    annotate_neutral_losses=annotate_neutral_losses,
+                )
+                outputs.append(out_pdf)
             found_scans.add(scan_id)
 
             if found_scans == wanted:
@@ -573,20 +644,38 @@ def parse_mzxml_and_render(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Visualize DDA spectra for a target peptide from pepXML and mzXML.")
-    p.add_argument("--pepxml", required=True, type=Path, help="Path to MS-GF+ pepXML file")
-    p.add_argument("--mzxml", required=True, type=Path, help="Path to mzXML file")
+    p.add_argument("--pepxml", required=True, nargs="+", type=Path, help="One or more MS-GF+ pepXML files")
+    p.add_argument("--mzxml", required=True, nargs="+", type=Path, help="One or more mzXML files")
     p.add_argument("--peptide", required=True, help="Target unmodified peptide sequence for exact matching")
     p.add_argument("--outdir", type=Path, default=Path("dda_vis_output"), help="Output directory for PDFs")
     p.add_argument(
         "--sample-id",
         default=None,
-        help="Sample ID in output filename. Default: mzXML basename without extension.",
+        help="Override sample ID in output filename for single-sample runs only.",
     )
     p.add_argument(
-        "--max-qvalue",
-        type=parse_optional_float,
-        default=0.01,
-        help="Max QValue filter. Use 'None' to disable. Default: 0.01",
+        "--score-type",
+        choices=("qvalue", "pepqvalue", "both", "none"),
+        default="qvalue",
+        help="Score filter field(s). Default: qvalue",
+    )
+    p.add_argument(
+        "--qvalue-threshold",
+        type=float,
+        default=0.1,
+        help="QValue threshold. Used when --score-type is qvalue or both. Default: 0.1",
+    )
+    p.add_argument(
+        "--pepqvalue-threshold",
+        type=float,
+        default=0.1,
+        help="PepQValue threshold. Used when --score-type is pepqvalue or both. Default: 0.1",
+    )
+    p.add_argument(
+        "--max-hit-rank",
+        type=int,
+        default=None,
+        help="Maximum hit rank to keep. Default: None (keep all ranks).",
     )
     p.add_argument(
         "--frag-tol-ppm",
@@ -631,39 +720,60 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
-
-    sample_id = args.sample_id if args.sample_id else args.mzxml.stem
     args.outdir.mkdir(parents=True, exist_ok=True)
-
-    psms_by_scan = select_psms(args.pepxml, args.peptide, args.max_qvalue)
-    if not psms_by_scan:
-        print("No matching PSMs found with current filters.")
-        return
-
-    total, found, missing, outputs = parse_mzxml_and_render(
-        mzxml_path=args.mzxml,
-        psms_by_scan=psms_by_scan,
-        sample_id=sample_id,
-        outdir=args.outdir,
-        frag_tol_ppm=args.frag_tol_ppm,
-        max_labels_per_series=args.max_labels_per_series,
-        topmap_min_rel_int=args.topmap_min_rel_int,
-        intensity_scale=args.intensity_scale,
-        annotate_neutral_losses=args.annotate_neutral_losses,
-    )
+    sample_pairs = pair_sample_files(args.pepxml, args.mzxml)
 
     print(f"Target peptide: {args.peptide}")
-    print(f"Matched scan IDs in pepXML: {total}")
-    print(f"Rendered MS2 PDFs: {found}")
-    if missing:
-        preview = ", ".join(map(str, missing[:20]))
-        tail = " ..." if len(missing) > 20 else ""
-        print(f"Missing MS2 scans in mzXML: {len(missing)} [{preview}{tail}]")
+    print(f"Sample pairs by basename: {len(sample_pairs)}")
+    grand_outputs = 0
 
-    print(f"Output directory: {args.outdir.resolve()}")
-    if outputs:
-        print("Example output file:")
-        print(f"  {outputs[0]}")
+    for sample_key, pepxml_path, mzxml_path in sample_pairs:
+        sample_id = args.sample_id if (args.sample_id and len(sample_pairs) == 1) else mzxml_path.stem
+        sample_outdir = args.outdir / safe_text(sample_id)
+        sample_outdir.mkdir(parents=True, exist_ok=True)
+
+        psms = select_psms(
+            pepxml_path=pepxml_path,
+            target_peptide=args.peptide,
+            score_type=args.score_type,
+            qvalue_threshold=args.qvalue_threshold,
+            pepqvalue_threshold=args.pepqvalue_threshold,
+            max_hit_rank=args.max_hit_rank,
+        )
+        if not psms:
+            print(f"[{sample_key}] No matching PSMs found with current filters.")
+            continue
+
+        unique_scans = len({x.scan_id for x in psms})
+        total_hits = len(psms)
+        found, outputs, missing = 0, [], []
+        total, found, missing, outputs = parse_mzxml_and_render(
+            mzxml_path=mzxml_path,
+            psms=psms,
+            sample_id=sample_id,
+            outdir=sample_outdir,
+            frag_tol_ppm=args.frag_tol_ppm,
+            max_labels_per_series=args.max_labels_per_series,
+            topmap_min_rel_int=args.topmap_min_rel_int,
+            intensity_scale=args.intensity_scale,
+            annotate_neutral_losses=args.annotate_neutral_losses,
+        )
+        grand_outputs += len(outputs)
+
+        print(f"[{sample_key}] pepXML={pepxml_path}")
+        print(f"[{sample_key}] mzXML={mzxml_path}")
+        print(f"[{sample_key}] Matched hits in pepXML: {total_hits} across {unique_scans} scan IDs")
+        print(f"[{sample_key}] Scan IDs rendered from mzXML: {found}/{total}")
+        print(f"[{sample_key}] Output PDFs: {len(outputs)}")
+        if missing:
+            preview = ", ".join(map(str, missing[:20]))
+            tail = " ..." if len(missing) > 20 else ""
+            print(f"[{sample_key}] Missing MS2 scans in mzXML: {len(missing)} [{preview}{tail}]")
+        if outputs:
+            print(f"[{sample_key}] Example output: {outputs[0]}")
+
+    print(f"Output directory root: {args.outdir.resolve()}")
+    print(f"Total PDFs generated: {grand_outputs}")
 
 
 if __name__ == "__main__":
