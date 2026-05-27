@@ -282,14 +282,18 @@ def match_theoretical_ions(
     mz_array: np.ndarray,
     int_array: np.ndarray,
     theoretical: Iterable[Tuple[str, float, str]],
-    frag_tol_ppm: float,
+    frag_tol: float,
+    frag_tol_unit: str,
 ) -> List[Dict]:
     matches: List[Dict] = []
     if mz_array.size == 0:
         return matches
 
     for ion_name, ion_mz, ion_series in theoretical:
-        tol = ion_mz * frag_tol_ppm * 1e-6
+        if frag_tol_unit == "ppm":
+            tol = ion_mz * frag_tol * 1e-6
+        else:
+            tol = frag_tol
         left = np.searchsorted(mz_array, ion_mz - tol, side="left")
         right = np.searchsorted(mz_array, ion_mz + tol, side="right")
         if left >= right:
@@ -324,9 +328,96 @@ def parse_ion_name(ion_name: str) -> Tuple[str, int, int, str]:
 
 def ion_label(ion_name: str) -> str:
     series, idx, charge, nl = parse_ion_name(ion_name)
-    core = f"{series}{idx}{nl}"
-    superscript_map = str.maketrans("0123456789+-", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻")
-    return f"{core}{f'{charge}+'.translate(superscript_map)}"
+    return f"{series}{idx}{nl}{charge}+"
+
+
+def ion_label_parts(ion_name: str) -> Tuple[str, str]:
+    series, idx, charge, nl = parse_ion_name(ion_name)
+    return f"{series}{idx}{nl}", f"{charge}+"
+
+
+def draw_charge_label(
+    ax: plt.Axes,
+    x: float,
+    y: float,
+    ion_name: str,
+    color: str,
+    ha: str,
+    base_size: float = 8.0,
+    sup_size: float = 6.2,
+    sup_dy: float = 0.048,
+    sup_dx_scale: float = 0.115,
+    sup_dx_offset: float = 0.0,
+) -> None:
+    base, sup = ion_label_parts(ion_name)
+    ax.text(
+        x,
+        y,
+        base,
+        fontsize=base_size,
+        ha=ha,
+        va="baseline",
+        color=color,
+        fontfamily="DejaVu Sans",
+    )
+    if ha == "left":
+        sup_x = x + sup_dx_scale * len(base) + sup_dx_offset
+    elif ha == "right":
+        sup_x = x + 0.006 + sup_dx_offset
+    else:
+        sup_x = x + 0.08 + sup_dx_offset
+    ax.text(
+        sup_x,
+        y + sup_dy,
+        sup,
+        fontsize=sup_size,
+        ha="left",
+        va="baseline",
+        color=color,
+        fontfamily="DejaVu Sans",
+    )
+
+
+def draw_charge_label_centered(
+    ax: plt.Axes,
+    x: float,
+    y: float,
+    ion_name: str,
+    color: str,
+    base_size: float = 9.0,
+    sup_size: float = 7.0,
+    sup_raise_points: float = 5.0,
+    sup_right_points: float = 4.0,
+) -> None:
+    # Draw a compact "base + superscript charge" label centered over (x, y).
+    base, sup = ion_label_parts(ion_name)
+    base_w = base_size * 0.58 * len(base)
+    sup_w = sup_size * 0.58 * len(sup)
+    total_w = base_w + sup_w
+    start_x = -0.5 * total_w
+
+    ax.annotate(
+        base,
+        xy=(x, y),
+        xytext=(start_x, 0),
+        textcoords="offset points",
+        ha="left",
+        va="bottom",
+        fontsize=base_size,
+        color=color,
+        fontfamily="DejaVu Sans",
+    )
+    ax.annotate(
+        sup,
+        xy=(x, y),
+        xytext=(start_x + base_w + sup_right_points, sup_raise_points),
+        textcoords="offset points",
+        ha="left",
+        va="bottom",
+        fontsize=sup_size,
+        color=color,
+        fontfamily="DejaVu Sans",
+    )
 
 
 def pick_peak_labels(
@@ -431,15 +522,18 @@ def draw_top_backbone(ax: plt.Axes, peptide: str, cleavage_labels: Dict[int, Dic
             h_len = 0.68
             ax.plot([x, x], [0.58, y_line], color=Y_COLOR, linewidth=0.8)
             ax.plot([x, x + h_len], [y_line, y_line], color=Y_COLOR, linewidth=0.8)
-            ax.text(
-                x + 0.04,
-                y_line - 0.02,
-                ion_label(cell["y"]["ion"]),
-                fontsize=8,
-                ha="left",
-                va="top",
+            draw_charge_label(
+                ax=ax,
+                x=x + 0.018,
+                y=y_line - 0.086,
+                ion_name=cell["y"]["ion"],
                 color=Y_COLOR,
-                fontfamily="DejaVu Sans",
+                ha="left",
+                base_size=8.0,
+                sup_size=6.0,
+                sup_dy=0.024,
+                sup_dx_scale=0.134,
+                sup_dx_offset=0.058,
             )
 
         if "b" in cell:
@@ -447,15 +541,18 @@ def draw_top_backbone(ax: plt.Axes, peptide: str, cleavage_labels: Dict[int, Dic
             h_len = 0.68
             ax.plot([x, x], [0.42, b_line], color=B_COLOR, linewidth=0.8)
             ax.plot([x - h_len, x], [b_line, b_line], color=B_COLOR, linewidth=0.8)
-            ax.text(
-                x - 0.06,
-                b_line + 0.02,
-                ion_label(cell["b"]["ion"]),
-                fontsize=8,
-                ha="right",
-                va="bottom",
+            draw_charge_label(
+                ax=ax,
+                x=x - 0.300,
+                y=b_line + 0.034,
+                ion_name=cell["b"]["ion"],
                 color=B_COLOR,
-                fontfamily="DejaVu Sans",
+                ha="right",
+                base_size=8.0,
+                sup_size=6.0,
+                sup_dy=0.030,
+                sup_dx_scale=0.106,
+                sup_dx_offset=0.000,
             )
 
 
@@ -465,7 +562,8 @@ def render_spectrum(
     int_array: np.ndarray,
     sample_id: str,
     outdir: Path,
-    frag_tol_ppm: float,
+    frag_tol: float,
+    frag_tol_unit: str,
     max_labels_per_series: int,
     topmap_min_rel_int: float,
     intensity_scale: str,
@@ -477,7 +575,7 @@ def render_spectrum(
         max_frag_charge=2,
         annotate_neutral_losses=annotate_neutral_losses,
     )
-    matches = match_theoretical_ions(mz_array, int_array, theoretical, frag_tol_ppm)
+    matches = match_theoretical_ions(mz_array, int_array, theoretical, frag_tol, frag_tol_unit)
 
     peak_series: Dict[int, str] = {}
     for m in matches:
@@ -528,7 +626,8 @@ def render_spectrum(
         idx = row["peak_idx"]
         mz = float(mz_array[idx])
         inten = float(plot_int[idx])
-        label_text = "/".join(ion_label(item["ion"]) for item in row["items"])
+        label_items = row["items"]
+        label_text = "/".join(ion_label(item["ion"]) for item in label_items)
         series_set = {item["series"] for item in row["items"]}
         if series_set == {"b"}:
             color = B_COLOR
@@ -539,16 +638,30 @@ def render_spectrum(
         yoff = 2.5 + (j % 3) * 2.0
         label_y = min(inten + yoff, y_max * 0.98)
 
-        ax.text(
-            mz,
-            label_y,
-            label_text,
-            fontsize=9,
-            ha="center",
-            va="bottom",
-            color=color,
-            fontfamily="DejaVu Sans",
-        )
+        if len(label_items) == 1:
+            # Keep charge as superscript style in intensity labels, consistent with top map.
+            draw_charge_label_centered(
+                ax=ax,
+                x=mz,
+                y=label_y,
+                ion_name=label_items[0]["ion"],
+                color=color,
+                base_size=9.0,
+                sup_size=7.0,
+                sup_raise_points=5.0,
+                sup_right_points=1.0,
+            )
+        else:
+            ax.text(
+                mz,
+                label_y,
+                label_text,
+                fontsize=9,
+                ha="center",
+                va="bottom",
+                color=color,
+                fontfamily="DejaVu Sans",
+            )
 
     ax.set_xlabel("m/z")
     ax.set_ylabel(y_label)
@@ -564,6 +677,9 @@ def render_spectrum(
 
     if psm.qvalue is not None:
         ax.text(0.01, 0.92, f"QValue={psm.qvalue:.4g}", transform=ax.transAxes, va="top", ha="left", fontsize=9)
+    if psm.pepqvalue is not None:
+        pepq_y = 0.86 if psm.qvalue is not None else 0.92
+        ax.text(0.01, pepq_y, f"PepQValue={psm.pepqvalue:.4g}", transform=ax.transAxes, va="top", ha="left", fontsize=9)
 
     if matches:
         ax.legend(loc="upper right", frameon=False, fontsize=9)
@@ -587,7 +703,8 @@ def parse_mzxml_and_render(
     psms: List[PSM],
     sample_id: str,
     outdir: Path,
-    frag_tol_ppm: float,
+    frag_tol: float,
+    frag_tol_unit: str,
     max_labels_per_series: int,
     topmap_min_rel_int: float,
     intensity_scale: str,
@@ -626,7 +743,8 @@ def parse_mzxml_and_render(
                     int_array=int_array,
                     sample_id=sample_id,
                     outdir=outdir,
-                    frag_tol_ppm=frag_tol_ppm,
+                    frag_tol=frag_tol,
+                    frag_tol_unit=frag_tol_unit,
                     max_labels_per_series=max_labels_per_series,
                     topmap_min_rel_int=topmap_min_rel_int,
                     intensity_scale=intensity_scale,
@@ -677,11 +795,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Maximum hit rank to keep. Default: None (keep all ranks).",
     )
+    p.add_argument("--frag-tol", type=float, default=20.0, help="Fragment ion match tolerance value. Default: 20")
+    p.add_argument(
+        "--frag-tol-unit",
+        choices=("ppm", "da"),
+        default="ppm",
+        help="Fragment ion tolerance unit. Default: ppm. Use 'da' for TPP-like matching.",
+    )
     p.add_argument(
         "--frag-tol-ppm",
         type=float,
-        default=20.0,
-        help="Fragment ion match tolerance in ppm. Default: 20",
+        default=None,
+        help="Deprecated alias of --frag-tol when --frag-tol-unit ppm.",
     )
     p.add_argument(
         "--max-labels-per-series",
@@ -720,6 +845,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    if args.frag_tol_ppm is not None:
+        args.frag_tol = args.frag_tol_ppm
+        args.frag_tol_unit = "ppm"
     args.outdir.mkdir(parents=True, exist_ok=True)
     sample_pairs = pair_sample_files(args.pepxml, args.mzxml)
 
@@ -729,8 +857,7 @@ def main() -> None:
 
     for sample_key, pepxml_path, mzxml_path in sample_pairs:
         sample_id = args.sample_id if (args.sample_id and len(sample_pairs) == 1) else mzxml_path.stem
-        sample_outdir = args.outdir / safe_text(sample_id)
-        sample_outdir.mkdir(parents=True, exist_ok=True)
+        sample_outdir = args.outdir
 
         psms = select_psms(
             pepxml_path=pepxml_path,
@@ -752,7 +879,8 @@ def main() -> None:
             psms=psms,
             sample_id=sample_id,
             outdir=sample_outdir,
-            frag_tol_ppm=args.frag_tol_ppm,
+            frag_tol=args.frag_tol,
+            frag_tol_unit=args.frag_tol_unit,
             max_labels_per_series=args.max_labels_per_series,
             topmap_min_rel_int=args.topmap_min_rel_int,
             intensity_scale=args.intensity_scale,
