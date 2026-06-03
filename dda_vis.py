@@ -420,6 +420,43 @@ def draw_charge_label_centered(
     )
 
 
+def draw_charge_label_from_anchor_points(
+    ax: plt.Axes,
+    anchor_x: float,
+    anchor_y: float,
+    ion_name: str,
+    color: str,
+    base_xytext: Tuple[float, float],
+    sup_xytext: Tuple[float, float],
+    base_size: float = 8.0,
+    sup_size: float = 6.0,
+) -> None:
+    # Place label using fixed point offsets from an anchor, so spacing is independent of data scale.
+    base, sup = ion_label_parts(ion_name)
+    ax.annotate(
+        base,
+        xy=(anchor_x, anchor_y),
+        xytext=base_xytext,
+        textcoords="offset points",
+        ha="right",
+        va="bottom",
+        fontsize=base_size,
+        color=color,
+        fontfamily="DejaVu Sans",
+    )
+    ax.annotate(
+        sup,
+        xy=(anchor_x, anchor_y),
+        xytext=sup_xytext,
+        textcoords="offset points",
+        ha="left",
+        va="bottom",
+        fontsize=sup_size,
+        color=color,
+        fontfamily="DejaVu Sans",
+    )
+
+
 def pick_peak_labels(
     matches: List[Dict],
     mz_array: np.ndarray,
@@ -524,16 +561,16 @@ def draw_top_backbone(ax: plt.Axes, peptide: str, cleavage_labels: Dict[int, Dic
             ax.plot([x, x + h_len], [y_line, y_line], color=Y_COLOR, linewidth=0.8)
             draw_charge_label(
                 ax=ax,
-                x=x + 0.018,
+                x=x + 0.160,
                 y=y_line - 0.086,
                 ion_name=cell["y"]["ion"],
                 color=Y_COLOR,
-                ha="left",
+                ha="right",
                 base_size=8.0,
                 sup_size=6.0,
                 sup_dy=0.024,
-                sup_dx_scale=0.134,
-                sup_dx_offset=0.058,
+                sup_dx_scale=0.106,
+                sup_dx_offset=0.000,
             )
 
         if "b" in cell:
@@ -541,18 +578,16 @@ def draw_top_backbone(ax: plt.Axes, peptide: str, cleavage_labels: Dict[int, Dic
             h_len = 0.68
             ax.plot([x, x], [0.42, b_line], color=B_COLOR, linewidth=0.8)
             ax.plot([x - h_len, x], [b_line, b_line], color=B_COLOR, linewidth=0.8)
-            draw_charge_label(
+            draw_charge_label_from_anchor_points(
                 ax=ax,
-                x=x - 0.300,
-                y=b_line + 0.034,
+                anchor_x=x,
+                anchor_y=b_line,
                 ion_name=cell["b"]["ion"],
                 color=B_COLOR,
-                ha="right",
+                base_xytext=(-11.0, 2.5),
+                sup_xytext=(-10.0, 6.0),
                 base_size=8.0,
                 sup_size=6.0,
-                sup_dy=0.030,
-                sup_dx_scale=0.106,
-                sup_dx_offset=0.000,
             )
 
 
